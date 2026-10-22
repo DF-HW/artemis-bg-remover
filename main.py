@@ -19,6 +19,10 @@
 
 import os
 import sys
+
+# macOS の Tk 非推奨警告を import tkinter の前に完全に抑制
+os.environ["TK_SILENCE_DEPRECATION"] = "1"
+
 import math
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -65,6 +69,11 @@ class AvatarEditorApp(ctk.CTk):
         # macOS/Windowsで他のウィンドウに隠れないよう起動時のみ最前面化し、その後解除する
         self.attributes("-topmost", True)
         self.after(500, lambda: self.attributes("-topmost", False))
+        if sys.platform == "darwin":
+            try:
+                os.system('''/usr/bin/osascript -e 'tell application "System Events" to set frontmost of first process whose unix id is %d to true' 2>/dev/null &''' % os.getpid())
+            except Exception:
+                pass
         
         # 外観のカラー設定
         self.configure(fg_color=C_BG[1])
@@ -104,6 +113,9 @@ class AvatarEditorApp(ctk.CTk):
             self.load_image(self.image_path)
         else:
             self.load_fallback_image()
+            
+        # 起動直後のキャンバスサイズ確定後に確実に描画するための遅延初期化
+        self.after(150, self.reset_zoom)
             
     def setup_ui(self):
         # メインコンテナのレイアウト
@@ -395,19 +407,21 @@ class AvatarEditorApp(ctk.CTk):
         self.update_canvas()
     def load_image(self, path):
         try:
+            # 読み込み・変換が完了するまでは現在の編集状態を保持する。
+            # 元ファイルは成功時・失敗時ともに確実に閉じる。
+            with Image.open(path) as img:
+                original_img = img.convert("RGBA")
+                current_img = original_img.copy()
             self.image_path = path
-            img = Image.open(path)
-            self.original_img = img.convert("RGBA")
-            self.current_img = self.original_img.copy()
+            self.original_img = original_img
+            self.current_img = current_img
             self.undo_stack.clear()
             self.redo_stack.clear()
             self.reset_zoom()
-            self.lbl_status.configure(text=f"読込完了: {os.path.basename(path)} ({img.width}x{img.height})")
+            self.lbl_status.configure(text=f"読込完了: {os.path.basename(path)} ({original_img.width}x{original_img.height})")
             self.update_canvas()
         except Exception as e:
-            self.attributes("-topmost", False)
-            messagebox.showerror("エラー", f"画像の読み込みに失敗しました:\n{e}")
-            self.attributes("-topmost", True)
+            messagebox.showerror("エラー", f"画像の読み込みに失敗しました:\n{e}", parent=self)
             
     def load_fallback_image(self):
         # ワークスペース内の preset アバターを探索
@@ -431,47 +445,47 @@ class AvatarEditorApp(ctk.CTk):
             self.lbl_status.configure(text="アバター画像が見つからないため、一時的なプレースホルダーを表示中")
             
     def open_image_dialog(self):
-        # -topmost による最前面固定を一時解除してファイルダイアログを前面に出す
-        self.attributes("-topmost", False)
-        path = filedialog.askopenfilename(
-            parent=self,
-            filetypes=[("PNG Images", "*.png"), ("All Files", "*.*")]
-        )
-        self.attributes("-topmost", True)
+        try:
+            path = filedialog.askopenfilename(
+                parent=self,
+                filetypes=[("PNG Images", "*.png"), ("All Files", "*.*")]
+            )
+        except (tk.TclError, OSError) as e:
+            messagebox.showerror("エラー", f"画像選択ダイアログを開けませんでした:\n{e}", parent=self)
+            return
         if path:
             self.load_image(path)
             
     def save_image(self):
-        if not self.image_path:
-            # 別名保存: -topmost を一時解除してダイアログを前面に出す
-            self.attributes("-topmost", False)
-            path = filedialog.asksaveasfilename(
-                parent=self,
-                defaultextension=".png",
-                filetypes=[("PNG Image", "*.png")]
-            )
-            self.attributes("-topmost", True)
-            if not path:
-                return
-            self.image_path = path
+        if self.current_img is None:
+            self.lbl_status.configure(text="保存する画像がありません。画像を読み込んでください。")
+            return
 
+        path = self.image_path
         try:
-            self.current_img.save(self.image_path, "PNG")
+            if not path:
+                path = filedialog.asksaveasfilename(
+                    parent=self,
+                    defaultextension=".png",
+                    filetypes=[("PNG Image", "*.png")]
+                )
+                if not path:
+                    return
+
+            self.current_img.save(path, "PNG")
+            # 保存に失敗したパスを次回の保存先として記憶しない。
+            self.image_path = path
             # -topmost設定によりmessageboxが裏に隠れてフリーズするため、
             # 保存完了はステータスバーのみで通知する
             self.lbl_status.configure(
                 text=f"✓ 保存完了: {os.path.basename(self.image_path)}"
             )
         except PermissionError:
-            self.lbl_status.configure(text="⚠ 保存失敗: ファイルが使用中です")
-            self.attributes("-topmost", False)
-            messagebox.showerror("保存エラー", f"ファイルへの書き込み権限がありません:\n{self.image_path}")
-            self.attributes("-topmost", True)
+            self.lbl_status.configure(text="⚠ 保存失敗: 書き込み権限またはファイルの使用状況を確認してください")
+            messagebox.showerror("保存エラー", f"ファイルへ書き込めません。権限または使用状況を確認してください:\n{path}", parent=self)
         except Exception as e:
             self.lbl_status.configure(text=f"⚠ 保存失敗: {e}")
-            self.attributes("-topmost", False)
-            messagebox.showerror("保存エラー", f"画像の保存に失敗しました:\n{e}")
-            self.attributes("-topmost", True)
+            messagebox.showerror("保存エラー", f"画像の保存に失敗しました:\n{e}", parent=self)
 
     # ==========================================
     # 画像編集ロジック (Undo/Redo 含む)
@@ -545,21 +559,17 @@ class AvatarEditorApp(ctk.CTk):
         
         try:
             from rembg import remove
-            self.push_state()
             # rembg.remove にPIL画像を渡して処理
             output_img = remove(self.current_img)
+            self.push_state()
             self.current_img = output_img
             self.update_canvas()
             self.lbl_status.configure(text="AI背景透過が成功しました！残った内側を調整してください。")
         except ImportError:
-            self.attributes("-topmost", False)
-            messagebox.showerror("インポートエラー", "rembg ライブラリがロードできません。仮想環境の依存関係を確認してください。")
-            self.attributes("-topmost", True)
+            messagebox.showerror("インポートエラー", "rembg ライブラリがロードできません。仮想環境の依存関係を確認してください。", parent=self)
             self.lbl_status.configure(text="AI背景透過に失敗しました（ライブラリ不在）")
         except Exception as e:
-            self.attributes("-topmost", False)
-            messagebox.showerror("エラー", f"AI背景透過実行中にエラーが発生しました:\n{e}")
-            self.attributes("-topmost", True)
+            messagebox.showerror("エラー", f"AI背景透過実行中にエラーが発生しました:\n{e}", parent=self)
             self.lbl_status.configure(text="AI背景透過エラー")
 
     # ==========================================
@@ -776,10 +786,14 @@ class AvatarEditorApp(ctk.CTk):
         pass
         
     def on_canvas_resize(self, event):
-        # 描画位置調整（初回のみ自動リセット）
+        # 描画位置調整（サイズ確定時に実行）
+        if event.width <= 1 or event.height <= 1:
+            return
         if not hasattr(self, "_canvas_initialized"):
             self._canvas_initialized = True
-            self.after(100, self.reset_zoom)
+            self.after(50, self.reset_zoom)
+        else:
+            self.update_canvas()
 
     # ==========================================
     # レンダラー: 市松模様背景 + 透過イメージの描画
@@ -797,6 +811,8 @@ class AvatarEditorApp(ctk.CTk):
         cw = self.canvas.winfo_width()
         ch = self.canvas.winfo_height()
         if cw <= 1 or ch <= 1:
+            # まだサイズが確定していない場合は短時間後に自動リトライ
+            self.after(50, self.update_canvas)
             return
             
         # 表示サイズ全体の計算
@@ -888,7 +904,8 @@ class AvatarEditorApp(ctk.CTk):
         bg.paste(resized_crop, (0, 0), resized_crop)
         
         # 5. Canvasに表示
-        self.photo_img = ImageTk.PhotoImage(bg)
+        self.photo_img = ImageTk.PhotoImage(bg, master=self.canvas)
+        self.canvas.image = self.photo_img  # GC（ガベージコレクション）およびTclインタプリタ不一致防止
         
         # クロップ領域のキャンバス上での描画開始理論座標
         cx = self.pan_x + ix1 * self.zoom_level
@@ -924,6 +941,18 @@ class AvatarEditorApp(ctk.CTk):
 if __name__ == "__main__":
     # 引数があればファイルパスとして読み込み
     path = sys.argv[1] if len(sys.argv) > 1 else None
+    
+    print("\n" + "=" * 55)
+    print("🎨 Artemis Avatar Editor が起動しました")
+    if path:
+        print(f"📁 読み込み画像: {path}")
+    else:
+        print("📁 読み込み画像: デフォルトアバター (assets/avatars/preset_01.png)")
+    print("🖥️  デスクトップ上に立ち上がったGUIエディタ画面をご確認ください")
+    print("💡 終了するにはウィンドウを閉じるか、ターミナルで Ctrl + C を押します")
+    print("=" * 55 + "\n")
+    sys.stdout.flush()
+
     app = AvatarEditorApp(path)
     
     # マウス移動時にブラシプレビューを更新するためバインド
